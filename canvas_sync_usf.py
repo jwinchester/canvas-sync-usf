@@ -46,6 +46,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "canvas-common"))
 import auth as canvas_auth  # noqa: E402
 import attachments as canvas_attachments  # noqa: E402
+import videos as canvas_videos  # noqa: E402
 
 
 # ---------- config ----------
@@ -313,12 +314,34 @@ def sync_modules(request, course, cdir, logfh):
 
 
 def sync_pages(request, course, cdir, logfh):
+    """Walk both /pages (which 404s on some USF subaccounts) AND modules
+    for type=Page items, fetch each via /pages/<slug>, save body as both
+    rendered .md and raw .html (so iframe video embeds survive)."""
     cid = course["id"]
     pages_dir = cdir / "pages"
     pages_dir.mkdir(exist_ok=True)
 
-    listing = api_list(request, f"courses/{cid}/pages", logfh=logfh)
-    _log(f"  pages: {len(listing)}", logfh)
+    try:
+        listing = api_list(request, f"courses/{cid}/pages", logfh=logfh) or []
+    except canvas_auth.AuthError:
+        raise
+    seen_urls: set[str] = {p.get("url") for p in listing if p.get("url")}
+
+    via_modules = 0
+    modules = load_json(cdir / "modules.json", [])
+    for m in modules:
+        for it in (m.get("items") or []):
+            if it.get("type") != "Page":
+                continue
+            pu = it.get("page_url")
+            if pu and pu not in seen_urls:
+                listing.append({"url": pu, "title": it.get("title")})
+                seen_urls.add(pu)
+                via_modules += 1
+    if via_modules:
+        _log(f"  pages: {len(listing)} ({via_modules} discovered via modules)", logfh)
+    else:
+        _log(f"  pages: {len(listing)}", logfh)
 
     index = []
     for p in listing:
@@ -329,20 +352,25 @@ def sync_pages(request, course, cdir, logfh):
         if not full:
             continue
         title = full.get("title") or purl
-        body_md = html_to_md(full.get("body") or "")
-        fname = f"{slugify(purl)}.md"
+        body_html = full.get("body") or ""
+        body_md = html_to_md(body_html)
+        stem = slugify(purl)
+        fname_md = f"{stem}.md"
+        fname_html = f"{stem}.html"
         header = (
             f"# {title}\n\n"
             f"_Updated: {full.get('updated_at')}_ — "
             f"[Open in Canvas]({full.get('html_url')})\n\n"
             "---\n\n"
         )
-        (pages_dir / fname).write_text(header + body_md + "\n", encoding="utf-8")
+        (pages_dir / fname_md).write_text(header + body_md + "\n", encoding="utf-8")
+        (pages_dir / fname_html).write_text(body_html, encoding="utf-8")
         index.append({
             "url": purl,
             "title": title,
             "updated_at": full.get("updated_at"),
-            "file": fname,
+            "file": fname_md,
+            "file_html": fname_html,
             "html_url": full.get("html_url"),
         })
 
@@ -852,6 +880,60 @@ def _render_feedback_md(cname, asg, sub, my_atts, comments):
     return "\n".join(lines)
 
 
+def extract_videos_for_course(course, cdir, logfh, videos_total):
+    """Walk every stored content surface for embedded video references and
+    write videos.json. Pulls from page .html (raw, not markdown), assignment
+    descriptions, announcement messages, and discussion entry messages."""
+    found: list[dict] = []
+    pages_dir = cdir / "pages"
+    if pages_dir.is_dir():
+        for hf in sorted(pages_dir.glob("*.html")):
+            try:
+                html = hf.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for v in canvas_videos.extract(html):
+                v["source_kind"] = "page"
+                v["source_file"] = hf.name
+                found.append(v)
+    for a in load_json(cdir / "assignments.json", []):
+        for v in canvas_videos.extract(a.get("description") or ""):
+            v["source_kind"] = "assignment"
+            v["source_id"] = a.get("id")
+            v["source_title"] = a.get("name")
+            found.append(v)
+    for a in load_json(cdir / "announcements.json", []):
+        for v in canvas_videos.extract(a.get("message") or ""):
+            v["source_kind"] = "announcement"
+            v["source_id"] = a.get("id")
+            v["source_title"] = a.get("title")
+            found.append(v)
+    disc_dir = cdir / "discussions"
+    if disc_dir.is_dir():
+        for vd in disc_dir.glob("*/view.json"):
+            view = load_json(vd, {})
+            entries = (view.get("view") or []) if isinstance(view, dict) else []
+            for entry in entries:
+                for v in canvas_videos.extract(entry.get("message") or ""):
+                    v["source_kind"] = "discussion"
+                    v["source_id"] = vd.parent.name
+                    found.append(v)
+            topic_path = vd.parent / "topic.json"
+            topic = load_json(topic_path, {})
+            for v in canvas_videos.extract(topic.get("message") or ""):
+                v["source_kind"] = "discussion-topic"
+                v["source_id"] = vd.parent.name
+                found.append(v)
+    save_json(cdir / "videos.json", found)
+    if found:
+        from collections import Counter
+        hosts = Counter(v["host"] for v in found)
+        _log(f"  videos: {len(found)} reference(s) — "
+             f"{', '.join(f'{n} {h}' for h, n in hosts.most_common())}", logfh)
+    videos_total[0] += len(found)
+    return len(found)
+
+
 def fetch_assignment_attachments_for_course(request, course, cdir, aa_stats, logfh):
     assignments = load_json(cdir / "assignments.json", [])
     if not assignments:
@@ -939,7 +1021,8 @@ def write_state_md(course, cdir, counts):
 
 
 def process_course(request, course, agg, logfh, files_bulk=False,
-                   dl_stats=None, sub_stats=None, aa_stats=None, disc_stats=None):
+                   dl_stats=None, sub_stats=None, aa_stats=None,
+                   disc_stats=None, videos_total=None):
     _log(f"\n[course] {course_label(course)} (id={course['id']})", logfh)
     cdir = course_dir(course)
     cdir.mkdir(parents=True, exist_ok=True)
@@ -965,6 +1048,8 @@ def process_course(request, course, agg, logfh, files_bulk=False,
         fetch_assignment_attachments_for_course(request, course, cdir, aa_stats, logfh)
     if disc_stats is not None:
         sync_discussions(request, course, cdir, disc_stats, logfh)
+    if videos_total is not None:
+        extract_videos_for_course(course, cdir, logfh, videos_total)
 
     write_state_md(course, cdir, counts)
 
@@ -1029,6 +1114,7 @@ def main():
                   "files_dl": 0, "files_skip": 0, "files_fail": 0,
                   "html_refs_dl": 0, "html_refs_skip": 0, "html_refs_fail": 0,
                   "bytes": 0}
+    videos_total = [0]  # mutable so process_course can increment
 
     with sync_playwright() as p:
         request = p.request.new_context(
@@ -1070,7 +1156,8 @@ def main():
                 process_course(request, course, agg, logfh,
                                files_bulk=opts.files_bulk, dl_stats=dl_stats,
                                sub_stats=sub_stats, aa_stats=aa_stats,
-                               disc_stats=disc_stats if opts.discussions else None)
+                               disc_stats=disc_stats if opts.discussions else None,
+                               videos_total=videos_total)
             except canvas_auth.AuthError as e:
                 _log(f"  [auth-fail mid-run] {course_label(course)}: {e}", logfh)
                 agg["auth_errors"].append(str(e))
@@ -1110,6 +1197,8 @@ def main():
              f"attachments {disc_stats['files_dl']}dl/{disc_stats['files_skip']}skip/{disc_stats['files_fail']}fail, "
              f"html-refs {disc_stats['html_refs_dl']}dl/{disc_stats['html_refs_skip']}skip/{disc_stats['html_refs_fail']}fail "
              f"({disc_stats['bytes'] / (1024 * 1024):.1f} MB)", logfh)
+    if videos_total[0]:
+        _log(f"  Videos:        {videos_total[0]} reference(s) catalogued in per-course videos.json", logfh)
     if agg["auth_errors"]:
         _log(f"  Auth errors: {len(agg['auth_errors'])}", logfh)
         for e in agg["auth_errors"]:
