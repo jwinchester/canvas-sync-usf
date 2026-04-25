@@ -1,0 +1,29 @@
+# Local data / mirror destination (never commit Canvas content)
+data/
+~/canvas-mirror/
+canvas-mirror/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Secrets (paranoia — tokens live at ~/.config/credentials/, not in the repo)
+*.token
+*token*.txt
+*.pem
+*.key
+client_secret*.json
