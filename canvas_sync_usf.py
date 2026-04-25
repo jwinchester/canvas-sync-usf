@@ -45,6 +45,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "canvas-common"))
 import auth as canvas_auth  # noqa: E402
+import attachments as canvas_attachments  # noqa: E402
 
 
 # ---------- config ----------
@@ -489,6 +490,227 @@ def sync_files_listing(request, course, cdir, logfh, files_bulk=False, dl_stats=
     return len(files), total_bytes
 
 
+def sync_submissions(request, course, cdir, sub_stats, logfh):
+    """Pull self-submissions with comments + history. Download my submitted
+    files and any instructor feedback attachments. Write feedback.md per
+    assignment that has anything worth keeping. Ported from Auckland scraper."""
+    cid = course["id"]
+    cname = course_label(course)
+    subs_root = cdir / "submissions"
+    subs_root.mkdir(exist_ok=True)
+
+    subs = api_list(request, f"courses/{cid}/students/submissions", params={
+        "student_ids[]": ["self"],
+        "include[]": [
+            "submission_comments",
+            "rubric_assessment",
+            "submission_history",
+            "assignment",
+        ],
+    }, logfh=logfh)
+
+    save_json(cdir / "submissions.json", subs)
+
+    meaningful = []
+    for s in subs:
+        if (s.get("attachments")
+            or s.get("submission_comments")
+            or s.get("rubric_assessment")
+            or s.get("body")
+            or s.get("submitted_at")
+            or s.get("score") is not None
+            or s.get("grade")):
+            meaningful.append(s)
+
+    if not meaningful:
+        _log("  submissions: none with content", logfh)
+        return
+
+    s_stats = {"assignments": 0, "my_files": 0, "feedback_files": 0,
+               "downloaded": 0, "skipped": 0, "failed": 0}
+
+    for s in meaningful:
+        asg = s.get("assignment") or {}
+        aid = s.get("assignment_id") or asg.get("id")
+        aname = asg.get("name") or f"assignment-{aid}"
+        sdir = subs_root / f"{aid}_{slugify(aname)}"
+        sdir.mkdir(parents=True, exist_ok=True)
+        save_json(sdir / "submission.json", s)
+        s_stats["assignments"] += 1
+
+        my_dir = sdir / "my"
+        fb_dir = sdir / "feedback"
+
+        my_attachments_index = []
+        for att in (s.get("attachments") or []):
+            att_id = att.get("id")
+            fname = canvas_attachments.safe_filename(
+                att.get("display_name") or att.get("filename") or f"att_{att_id}"
+            )
+            stored = f"{att_id}_{fname}"
+            dest = my_dir / stored
+            url = att.get("url")
+            if not url:
+                continue
+            status, _ = canvas_attachments.download_url_to_path(
+                url, dest, expected_size=att.get("size"),
+                user_agent=USER_AGENT,
+                logger=lambda m: _log(m, logfh),
+            )
+            if status == "downloaded":
+                s_stats["downloaded"] += 1
+            elif status == "skipped_exists":
+                s_stats["skipped"] += 1
+            else:
+                s_stats["failed"] += 1
+            s_stats["my_files"] += 1
+            my_attachments_index.append({
+                "stored": stored, "display": att.get("display_name"),
+                "size": att.get("size"),
+            })
+            time.sleep(0.1)
+
+        feedback_comments_index = []
+        for co in (s.get("submission_comments") or []):
+            author = co.get("author_name") or (co.get("author") or {}).get("display_name") or "instructor"
+            co_entry = {
+                "author": author,
+                "created_at": co.get("created_at"),
+                "comment": co.get("comment"),
+                "attachments": [],
+            }
+            for att in (co.get("attachments") or []):
+                att_id = att.get("id")
+                fname = canvas_attachments.safe_filename(
+                    att.get("display_name") or att.get("filename") or f"att_{att_id}"
+                )
+                stored = f"{att_id}_{fname}"
+                dest = fb_dir / stored
+                url = att.get("url")
+                if not url:
+                    continue
+                status, _ = canvas_attachments.download_url_to_path(
+                    url, dest, expected_size=att.get("size"),
+                    user_agent=USER_AGENT,
+                    logger=lambda m: _log(m, logfh),
+                )
+                if status == "downloaded":
+                    s_stats["downloaded"] += 1
+                elif status == "skipped_exists":
+                    s_stats["skipped"] += 1
+                else:
+                    s_stats["failed"] += 1
+                s_stats["feedback_files"] += 1
+                co_entry["attachments"].append({
+                    "stored": stored, "display": att.get("display_name"),
+                    "size": att.get("size"),
+                })
+                time.sleep(0.1)
+            feedback_comments_index.append(co_entry)
+
+        (sdir / "feedback.md").write_text(
+            _render_feedback_md(cname, asg, s, my_attachments_index, feedback_comments_index),
+            encoding="utf-8",
+        )
+
+    _log(f"  submissions: {s_stats['assignments']} assignment(s), "
+         f"{s_stats['my_files']} my-file(s), {s_stats['feedback_files']} feedback-file(s) — "
+         f"{s_stats['downloaded']} dl / {s_stats['skipped']} skip / {s_stats['failed']} fail", logfh)
+
+    for k in s_stats:
+        sub_stats[k] += s_stats[k]
+
+
+def _render_feedback_md(cname, asg, sub, my_atts, comments):
+    lines = [f"# {asg.get('name') or 'Submission'}", ""]
+    lines.append(f"- **Course:** {cname}")
+    lines.append(f"- **Assignment:** {asg.get('html_url') or ''}")
+    lines.append(f"- **Points possible:** {asg.get('points_possible')}")
+    lines.append(f"- **Due:** {asg.get('due_at') or '—'}")
+    lines.append("")
+
+    lines.append("## My submission")
+    lines.append("")
+    lines.append(f"- Submitted at: {sub.get('submitted_at') or '—'}")
+    lines.append(f"- State: `{sub.get('workflow_state')}`, attempt {sub.get('attempt')}")
+    lines.append(f"- Late: {sub.get('late')}   Missing: {sub.get('missing')}   Excused: {sub.get('excused')}")
+    if my_atts:
+        lines.append("")
+        lines.append("Files:")
+        for a in my_atts:
+            size_mb = (a.get("size") or 0) / 1024 / 1024
+            lines.append(f"- `my/{a['stored']}` — {a.get('display') or a['stored']} ({size_mb:.2f} MB)")
+    body = sub.get("body")
+    if body:
+        lines.append("")
+        lines.append("### Text body")
+        lines.append("")
+        lines.append(html_to_md(body))
+    lines.append("")
+
+    lines.append("## Grade")
+    lines.append("")
+    lines.append(f"- Score: **{sub.get('score')}** / {asg.get('points_possible')}")
+    lines.append(f"- Grade string: `{sub.get('grade')}`")
+    lines.append(f"- Graded at: {sub.get('graded_at') or '—'}")
+    lines.append("")
+
+    rubric = asg.get("rubric") or []
+    ra = sub.get("rubric_assessment") or {}
+    if rubric and ra:
+        lines.append("## Rubric")
+        lines.append("")
+        for crit in rubric:
+            ckey = crit.get("id")
+            got = ra.get(ckey, {}) if isinstance(ra, dict) else {}
+            pts = got.get("points")
+            max_pts = crit.get("points")
+            lines.append(f"### {crit.get('description') or ckey} — "
+                         f"{pts if pts is not None else '—'} / {max_pts}")
+            if got.get("comments"):
+                lines.append("")
+                for cline in str(got["comments"]).splitlines():
+                    lines.append(f"> {cline}")
+            lines.append("")
+
+    if comments:
+        lines.append("## Feedback comments")
+        lines.append("")
+        for co in comments:
+            lines.append(f"### {co['author']} — {co.get('created_at') or ''}")
+            lines.append("")
+            text = co.get("comment")
+            if text:
+                for t in str(text).splitlines():
+                    lines.append(t)
+                lines.append("")
+            for att in co.get("attachments") or []:
+                size_mb = (att.get("size") or 0) / 1024 / 1024
+                label = att.get("display") or att["stored"]
+                lines.append(f"- 📎 [`feedback/{att['stored']}`](feedback/{att['stored']}) — "
+                             f"{label} ({size_mb:.2f} MB)")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def fetch_assignment_attachments_for_course(request, course, cdir, aa_stats, logfh):
+    assignments = load_json(cdir / "assignments.json", [])
+    if not assignments:
+        return
+    files_meta = load_json(cdir / "files.json", [])
+    known_ids: set[int] = {f.get("id") for f in files_meta if f.get("id")}
+    descs = (a.get("description") for a in assignments)
+    s = canvas_attachments.fetch_assignment_attachments(
+        request, CANVAS_HOST, course["id"], descs,
+        dest_dir=cdir / "files" / "_assignment_attachments",
+        known_file_ids=known_ids,
+        user_agent=USER_AGENT,
+        logger=lambda m: _log(m, logfh),
+    )
+    for k in aa_stats:
+        aa_stats[k] += s[k]
+
+
 def sync_lti_external_skipped(tabs, modules, cdir, logfh):
     skipped = []
     seen = set()
@@ -557,7 +779,8 @@ def write_state_md(course, cdir, counts):
     (cdir / "STATE.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def process_course(request, course, agg, logfh, files_bulk=False, dl_stats=None):
+def process_course(request, course, agg, logfh, files_bulk=False,
+                   dl_stats=None, sub_stats=None, aa_stats=None):
     _log(f"\n[course] {course_label(course)} (id={course['id']})", logfh)
     cdir = course_dir(course)
     cdir.mkdir(parents=True, exist_ok=True)
@@ -576,6 +799,11 @@ def process_course(request, course, agg, logfh, files_bulk=False, dl_stats=None)
     counts["files_bytes"]   = files_bytes
     modules_data = load_json(cdir / "modules.json", [])
     counts["lti"]           = sync_lti_external_skipped(tabs, modules_data, cdir, logfh)
+
+    if sub_stats is not None:
+        sync_submissions(request, course, cdir, sub_stats, logfh)
+    if aa_stats is not None:
+        fetch_assignment_attachments_for_course(request, course, cdir, aa_stats, logfh)
 
     write_state_md(course, cdir, counts)
 
@@ -629,6 +857,10 @@ def main():
     }
     dl_stats = {"downloaded": 0, "skipped": 0, "failed": 0, "locked": 0,
                 "bytes": 0, "courses": {}, "large_files": []}
+    sub_stats = {"assignments": 0, "my_files": 0, "feedback_files": 0,
+                 "downloaded": 0, "skipped": 0, "failed": 0}
+    aa_stats = {"discovered": 0, "new": 0, "downloaded": 0,
+                "skipped": 0, "failed": 0, "bytes": 0}
 
     with sync_playwright() as p:
         request = p.request.new_context(
@@ -668,7 +900,8 @@ def main():
         for course in courses:
             try:
                 process_course(request, course, agg, logfh,
-                               files_bulk=opts.files_bulk, dl_stats=dl_stats)
+                               files_bulk=opts.files_bulk, dl_stats=dl_stats,
+                               sub_stats=sub_stats, aa_stats=aa_stats)
             except canvas_auth.AuthError as e:
                 _log(f"  [auth-fail mid-run] {course_label(course)}: {e}", logfh)
                 agg["auth_errors"].append(str(e))
@@ -695,13 +928,26 @@ def main():
     else:
         _log(f"  File records:  {agg['files']}  ({agg['files_bytes'] / (1024 * 1024):.1f} MB — not downloaded)", logfh)
     _log(f"  LTI externals: {agg['lti']}", logfh)
+    if sub_stats["assignments"]:
+        _log(f"  Submissions:   {sub_stats['assignments']} assignment(s) — "
+             f"{sub_stats['my_files']} my-file(s), {sub_stats['feedback_files']} feedback-file(s) "
+             f"({sub_stats['downloaded']} dl / {sub_stats['skipped']} skip / {sub_stats['failed']} fail)", logfh)
+    if aa_stats["discovered"]:
+        _log(f"  Asg-attachments: {aa_stats['discovered']} ref(s), {aa_stats['new']} new — "
+             f"{aa_stats['downloaded']} dl / {aa_stats['skipped']} skip / {aa_stats['failed']} fail "
+             f"({aa_stats['bytes'] / (1024 * 1024):.1f} MB)", logfh)
     if agg["auth_errors"]:
         _log(f"  Auth errors: {len(agg['auth_errors'])}", logfh)
         for e in agg["auth_errors"]:
             _log(f"    {e}", logfh)
 
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_json(LOGS_DIR / f"usf-summary-{ts}.json", {**agg, "downloads": dl_stats if opts.files_bulk else None})
+    save_json(LOGS_DIR / f"usf-summary-{ts}.json", {
+        **agg,
+        "downloads": dl_stats if opts.files_bulk else None,
+        "submissions": sub_stats,
+        "assignment_attachments": aa_stats,
+    })
 
     if logfh:
         _log(f"=== canvas_sync_usf.py run ended {datetime.datetime.now().isoformat()} ===", logfh)
