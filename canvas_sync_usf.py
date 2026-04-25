@@ -490,6 +490,165 @@ def sync_files_listing(request, course, cdir, logfh, files_bulk=False, dl_stats=
     return len(files), total_bytes
 
 
+def _walk_discussion_entries(entries):
+    """Flatten the Canvas Discussion View tree (entries with nested .replies)."""
+    for e in entries or []:
+        yield e
+        yield from _walk_discussion_entries(e.get("replies") or [])
+
+
+def _render_discussion_md(course, topic, view, participants_by_id):
+    lines = [f"# {topic.get('title') or '(untitled topic)'}", ""]
+    lines.append(f"- **Course:** {course_label(course)}")
+    lines.append(f"- **Posted:** {topic.get('posted_at') or '—'}  by user "
+                 f"{topic.get('user_name') or topic.get('author', {}).get('display_name') or topic.get('user_id')}")
+    lines.append(f"- **Last reply:** {topic.get('last_reply_at') or '—'}")
+    lines.append(f"- **Canvas:** {topic.get('html_url') or ''}")
+    lines.append(f"- **Type:** {topic.get('discussion_type') or '—'}, "
+                 f"published={topic.get('published')}, locked={topic.get('locked')}")
+    lines.append("")
+    lines.append("## Original post")
+    lines.append("")
+    lines.append(html_to_md(topic.get("message") or ""))
+    lines.append("")
+
+    if topic.get("attachments"):
+        lines.append("### Topic attachments")
+        for a in topic["attachments"]:
+            size_mb = (a.get("size") or 0) / 1024 / 1024
+            label = a.get("display_name") or a.get("filename") or f"file-{a.get('id')}"
+            lines.append(f"- 📎 [`files/{a.get('id')}_{label}`](files/{a.get('id')}_{label}) — "
+                         f"{label} ({size_mb:.2f} MB)")
+        lines.append("")
+
+    entries = (view or {}).get("view", []) if isinstance(view, dict) else []
+    flat = list(_walk_discussion_entries(entries))
+    if flat:
+        lines.append(f"## Replies ({len(flat)})")
+        lines.append("")
+        for e in flat:
+            uid = e.get("user_id")
+            uname = participants_by_id.get(uid, {}).get("display_name") if uid else None
+            uname = uname or f"user-{uid}"
+            depth = "  " * (e.get("parent_id") and 1 or 0)
+            lines.append(f"### {uname} — {e.get('created_at') or ''}")
+            if e.get("deleted"):
+                lines.append("_(deleted)_")
+            else:
+                msg = html_to_md(e.get("message") or "")
+                for line in msg.splitlines() or [""]:
+                    lines.append(line)
+            atts = e.get("attachments") or ([e.get("attachment")] if e.get("attachment") else [])
+            atts = [a for a in atts if a]
+            for a in atts:
+                size_mb = (a.get("size") or 0) / 1024 / 1024
+                label = a.get("display_name") or a.get("filename") or f"file-{a.get('id')}"
+                lines.append(f"- 📎 [`files/{a.get('id')}_{label}`](files/{a.get('id')}_{label}) — "
+                             f"{label} ({size_mb:.2f} MB)")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def sync_discussions(request, course, cdir, disc_stats, logfh):
+    """Pull all non-announcement discussion topics with full thread view,
+    download topic + entry attachments, and resolve any instructure_file_link
+    refs from message HTML. Writes per-topic dir with topic.json, view.json,
+    thread.md, and files/."""
+    cid = course["id"]
+    out_dir = cdir / "discussions"
+    out_dir.mkdir(exist_ok=True)
+
+    topics = api_list(request, f"courses/{cid}/discussion_topics", logfh=logfh) or []
+    save_json(cdir / "discussions.json", topics)
+    non_announce = [t for t in topics if not t.get("is_announcement")]
+    if not non_announce:
+        _log("  discussions: 0 (no non-announcement topics)", logfh)
+        return
+    _log(f"  discussions: {len(non_announce)} topic(s)", logfh)
+
+    known_file_ids: set[int] = set()
+    files_meta = load_json(cdir / "files.json", [])
+    known_file_ids |= {f.get("id") for f in files_meta if f.get("id")}
+
+    for topic in non_announce:
+        tid = topic.get("id")
+        title = topic.get("title") or f"topic-{tid}"
+        stem = f"{tid}_{slugify(title)}"
+        tdir = out_dir / stem
+        tdir.mkdir(parents=True, exist_ok=True)
+        save_json(tdir / "topic.json", topic)
+        files_dir = tdir / "files"
+
+        view = api_get(request, f"courses/{cid}/discussion_topics/{tid}/view", logfh=logfh)
+        if view:
+            save_json(tdir / "view.json", view)
+
+        participants_by_id = {p.get("id"): p for p in (view or {}).get("participants", []) if p.get("id")}
+
+        (tdir / "thread.md").write_text(
+            _render_discussion_md(course, topic, view, participants_by_id),
+            encoding="utf-8",
+        )
+        disc_stats["topics"] += 1
+
+        all_atts = []
+        for a in (topic.get("attachments") or []):
+            if a:
+                all_atts.append(a)
+
+        message_htmls = [topic.get("message") or ""]
+        for entry in _walk_discussion_entries((view or {}).get("view", []) if isinstance(view, dict) else []):
+            disc_stats["entries"] += 1
+            message_htmls.append(entry.get("message") or "")
+            atts = entry.get("attachments") or ([entry.get("attachment")] if entry.get("attachment") else [])
+            for a in atts:
+                if a:
+                    all_atts.append(a)
+
+        for att in all_atts:
+            att_id = att.get("id")
+            if not att_id:
+                continue
+            url = att.get("url")
+            if not url:
+                continue
+            fname = canvas_attachments.safe_filename(
+                att.get("display_name") or att.get("filename") or f"att_{att_id}"
+            )
+            dest = files_dir / f"{att_id}_{fname}"
+            status, written = canvas_attachments.download_url_to_path(
+                url, dest, expected_size=att.get("size"),
+                user_agent=USER_AGENT,
+                logger=lambda m: _log(m, logfh),
+            )
+            if status == "downloaded":
+                disc_stats["files_dl"] += 1
+                disc_stats["bytes"] += written
+            elif status == "skipped_exists":
+                disc_stats["files_skip"] += 1
+                disc_stats["bytes"] += written
+            else:
+                disc_stats["files_fail"] += 1
+            time.sleep(0.1)
+
+        s = canvas_attachments.fetch_assignment_attachments(
+            request, CANVAS_HOST, cid, message_htmls,
+            dest_dir=files_dir,
+            known_file_ids=known_file_ids,
+            user_agent=USER_AGENT,
+            logger=lambda m: _log(m, logfh),
+        )
+        disc_stats["html_refs_dl"] += s["downloaded"]
+        disc_stats["html_refs_skip"] += s["skipped"]
+        disc_stats["html_refs_fail"] += s["failed"]
+        disc_stats["bytes"] += s["bytes"]
+
+    _log(f"  discussions done: {disc_stats['topics']} topics, {disc_stats['entries']} entries, "
+         f"attachments {disc_stats['files_dl']}dl/{disc_stats['files_skip']}skip/{disc_stats['files_fail']}fail, "
+         f"html-refs {disc_stats['html_refs_dl']}dl/{disc_stats['html_refs_skip']}skip/{disc_stats['html_refs_fail']}fail",
+         logfh)
+
+
 def sync_submissions(request, course, cdir, sub_stats, logfh):
     """Pull self-submissions with comments + history. Download my submitted
     files and any instructor feedback attachments. Write feedback.md per
@@ -780,7 +939,7 @@ def write_state_md(course, cdir, counts):
 
 
 def process_course(request, course, agg, logfh, files_bulk=False,
-                   dl_stats=None, sub_stats=None, aa_stats=None):
+                   dl_stats=None, sub_stats=None, aa_stats=None, disc_stats=None):
     _log(f"\n[course] {course_label(course)} (id={course['id']})", logfh)
     cdir = course_dir(course)
     cdir.mkdir(parents=True, exist_ok=True)
@@ -804,6 +963,8 @@ def process_course(request, course, agg, logfh, files_bulk=False,
         sync_submissions(request, course, cdir, sub_stats, logfh)
     if aa_stats is not None:
         fetch_assignment_attachments_for_course(request, course, cdir, aa_stats, logfh)
+    if disc_stats is not None:
+        sync_discussions(request, course, cdir, disc_stats, logfh)
 
     write_state_md(course, cdir, counts)
 
@@ -837,6 +998,9 @@ def main():
     parser.add_argument("--files-bulk", action="store_true",
                         help="Also download every non-locked course file under <course>/files/. "
                              "Resumes via on-disk size dedupe.")
+    parser.add_argument("--discussions", action="store_true",
+                        help="Pull non-announcement discussion topics with full thread view + "
+                             "all entry attachments + html-linked files.")
     opts = parser.parse_args()
 
     MIRROR_ROOT.mkdir(parents=True, exist_ok=True)
@@ -861,6 +1025,10 @@ def main():
                  "downloaded": 0, "skipped": 0, "failed": 0}
     aa_stats = {"discovered": 0, "new": 0, "downloaded": 0,
                 "skipped": 0, "failed": 0, "bytes": 0}
+    disc_stats = {"topics": 0, "entries": 0,
+                  "files_dl": 0, "files_skip": 0, "files_fail": 0,
+                  "html_refs_dl": 0, "html_refs_skip": 0, "html_refs_fail": 0,
+                  "bytes": 0}
 
     with sync_playwright() as p:
         request = p.request.new_context(
@@ -901,7 +1069,8 @@ def main():
             try:
                 process_course(request, course, agg, logfh,
                                files_bulk=opts.files_bulk, dl_stats=dl_stats,
-                               sub_stats=sub_stats, aa_stats=aa_stats)
+                               sub_stats=sub_stats, aa_stats=aa_stats,
+                               disc_stats=disc_stats if opts.discussions else None)
             except canvas_auth.AuthError as e:
                 _log(f"  [auth-fail mid-run] {course_label(course)}: {e}", logfh)
                 agg["auth_errors"].append(str(e))
@@ -936,6 +1105,11 @@ def main():
         _log(f"  Asg-attachments: {aa_stats['discovered']} ref(s), {aa_stats['new']} new — "
              f"{aa_stats['downloaded']} dl / {aa_stats['skipped']} skip / {aa_stats['failed']} fail "
              f"({aa_stats['bytes'] / (1024 * 1024):.1f} MB)", logfh)
+    if opts.discussions and disc_stats["topics"]:
+        _log(f"  Discussions:   {disc_stats['topics']} topic(s), {disc_stats['entries']} entries — "
+             f"attachments {disc_stats['files_dl']}dl/{disc_stats['files_skip']}skip/{disc_stats['files_fail']}fail, "
+             f"html-refs {disc_stats['html_refs_dl']}dl/{disc_stats['html_refs_skip']}skip/{disc_stats['html_refs_fail']}fail "
+             f"({disc_stats['bytes'] / (1024 * 1024):.1f} MB)", logfh)
     if agg["auth_errors"]:
         _log(f"  Auth errors: {len(agg['auth_errors'])}", logfh)
         for e in agg["auth_errors"]:
@@ -947,6 +1121,7 @@ def main():
         "downloads": dl_stats if opts.files_bulk else None,
         "submissions": sub_stats,
         "assignment_attachments": aa_stats,
+        "discussions": disc_stats if opts.discussions else None,
     })
 
     if logfh:
