@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Thin invocation wrapper for canvas_sync_usf.py.
-# Runs with a timestamped log under ~/canvas-mirror/logs/.
+# Runs with a timestamped log under ~/jon-claude-grand-ham/canvas-mirror/logs/.
 # Pass-through args go to the python script.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TS="$(date +%Y%m%d-%H%M%S)"
-LOG_DIR="${HOME}/canvas-mirror/logs"
+LOG_DIR="${HOME}/jon-claude-grand-ham/canvas-mirror/logs"
 mkdir -p "$LOG_DIR"
 LOG="${LOG_DIR}/usf-sync-${TS}.log"
 

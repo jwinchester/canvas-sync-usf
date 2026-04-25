@@ -29,8 +29,10 @@ import datetime
 import json
 import os
 import re
+import shutil
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -41,12 +43,15 @@ try:
 except ImportError:
     _md = None
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "canvas-common"))
+import auth as canvas_auth  # noqa: E402
+
 
 # ---------- config ----------
 
 BASE = Path(__file__).parent
-MIRROR_ROOT = Path.home() / "canvas-mirror" / "usf"
-LOGS_DIR = Path.home() / "canvas-mirror" / "logs"
+MIRROR_ROOT = Path.home() / "jon-claude-grand-ham" / "canvas-mirror" / "usf"
+LOGS_DIR = Path.home() / "jon-claude-grand-ham" / "canvas-mirror" / "logs"
 CANVAS_HOST = "https://usfca.instructure.com"
 API_BASE = f"{CANVAS_HOST}/api/v1"
 
@@ -55,6 +60,7 @@ USF_TOKEN_PATH = Path.home() / ".config" / "credentials" / "usfca_canvas_token.t
 USER_AGENT = "usf-canvas-sync/1.0 (personal study sync; contact jwin74@gmail.com)"
 
 RATE_FLOOR_S = 0.15  # 150 ms
+LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500 MB
 
 
 # ---------- small helpers (ported from UoA sync) ----------
@@ -161,6 +167,9 @@ def rate_throttle(resp):
 def api_get(request, path, params=None, logfh=None):
     url = build_url(path, params)
     resp = request.get(url)
+    err = canvas_auth.detect_failure_in_response(resp, scope="usf", expect_json=True)
+    if err:
+        raise err
     if resp.status >= 400:
         _log(f"  [warn] HTTP {resp.status} GET {path}", logfh)
         return None
@@ -178,6 +187,9 @@ def api_list(request, path, params=None, logfh=None):
     items = []
     while url:
         resp = request.get(url)
+        err = canvas_auth.detect_failure_in_response(resp, scope="usf", expect_json=True)
+        if err:
+            raise err
         if resp.status >= 400:
             _log(f"  [warn] HTTP {resp.status} GET {url}", logfh)
             break
@@ -337,14 +349,143 @@ def sync_pages(request, course, cdir, logfh):
     return len(index)
 
 
-def sync_files_listing(request, course, cdir, logfh):
-    """Metadata only — we are NOT bulk-downloading files for USF."""
+def download_stream(url, dest, expected_size=None, logfh=None):
+    """Stream-download a file with atomic rename. USF file URLs from the API
+    carry a verifier so no auth header is needed. Returns (status, bytes)
+    where status is 'downloaded' | 'skipped_exists' | 'failed'."""
+    if dest.exists() and expected_size:
+        try:
+            if dest.stat().st_size == expected_size:
+                return "skipped_exists", dest.stat().st_size
+        except Exception:
+            pass
+
+    tmp = dest.with_name(dest.name + ".part")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            with open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f, length=131072)
+        tmp.rename(dest)
+        return "downloaded", dest.stat().st_size
+    except Exception as e:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+        _log(f"    [dl-fail] {dest.name}: {e}", logfh)
+        return "failed", 0
+
+
+def sync_files_listing(request, course, cdir, logfh, files_bulk=False, dl_stats=None):
+    """Always emit files.json (metadata). When files_bulk=True, also walk the
+    folder hierarchy and download every non-locked file under <course>/files/.
+    Dedupes against on-disk size. dl_stats is mutated in-place when bulk."""
     cid = course["id"]
     files = api_list(request, f"courses/{cid}/files", logfh=logfh)
     save_json(cdir / "files.json", files)
     total_bytes = sum((f.get("size") or 0) for f in files)
-    _log(f"  files listing: {len(files)} "
-         f"({total_bytes / (1024 * 1024):.1f} MB if downloaded — NOT downloading)", logfh)
+
+    if not files_bulk:
+        _log(f"  files listing: {len(files)} "
+             f"({total_bytes / (1024 * 1024):.1f} MB if downloaded — NOT downloading)", logfh)
+        return len(files), total_bytes
+
+    folders = api_list(request, f"courses/{cid}/folders", logfh=logfh) or []
+    folder_paths = {}
+    for f in folders:
+        fid = f.get("id")
+        full = f.get("full_name", "") or ""
+        if full == "course files":
+            rel = ""
+        elif full.startswith("course files/"):
+            rel = full[len("course files/"):]
+        else:
+            rel = full
+        folder_paths[fid] = rel
+
+    modules = load_json(cdir / "modules.json", [])
+    file_ids = {f.get("id") for f in files if f.get("id")}
+    extras = []
+    for m in modules:
+        for it in (m.get("items") or []):
+            if it.get("type") == "File":
+                fid = it.get("content_id")
+                if fid and fid not in file_ids:
+                    extra = api_get(request, f"files/{fid}", logfh=logfh)
+                    if extra:
+                        extras.append(extra)
+                        file_ids.add(fid)
+    if extras:
+        _log(f"  +{len(extras)} module-only file(s) discovered", logfh)
+        files = files + extras
+
+    files_dir = cdir / "files"
+    files_dir.mkdir(exist_ok=True)
+    c = {"downloaded": 0, "skipped": 0, "failed": 0, "locked": 0,
+         "total": len(files), "bytes": 0}
+    cname = course_label(course)
+    large_here = []
+
+    for i, fobj in enumerate(files, 1):
+        fid = fobj.get("id")
+        display = fobj.get("display_name") or fobj.get("filename") or f"file_{fid}"
+        size = fobj.get("size") or 0
+        url = fobj.get("url")
+        locked = fobj.get("locked_for_user") or fobj.get("locked")
+
+        if locked:
+            c["locked"] += 1
+            _log(f"  [{i}/{len(files)}] [locked] {display}", logfh)
+            continue
+        if not url:
+            c["failed"] += 1
+            _log(f"  [{i}/{len(files)}] [no-url] {display}", logfh)
+            continue
+
+        folder_rel = folder_paths.get(fobj.get("folder_id"), "")
+        dest = files_dir
+        for part in folder_rel.split("/"):
+            if part:
+                dest = dest / safe_filename(part)
+        dest = dest / safe_filename(display)
+
+        size_mb = size / 1024 / 1024
+        if size >= LARGE_FILE_THRESHOLD:
+            large_here.append({"course": cname, "name": display, "size": size, "path": str(dest)})
+            _log(f"  [{i}/{len(files)}] [LARGE {size_mb:.0f} MB] {display}", logfh)
+
+        status, written = download_stream(url, dest, expected_size=size, logfh=logfh)
+        if status == "downloaded":
+            c["downloaded"] += 1
+            c["bytes"] += written
+            _log(f"  [{i}/{len(files)}] [+ {size_mb:.1f} MB] {display}", logfh)
+        elif status == "skipped_exists":
+            c["skipped"] += 1
+            c["bytes"] += written
+            _log(f"  [{i}/{len(files)}] [= {size_mb:.1f} MB] {display}", logfh)
+        else:
+            c["failed"] += 1
+
+        time.sleep(RATE_FLOOR_S)
+
+    if dl_stats is not None:
+        dl_stats["courses"][cname] = c
+        for k in ("downloaded", "skipped", "failed", "locked", "bytes"):
+            dl_stats[k] += c[k]
+        dl_stats["large_files"].extend(large_here)
+
+    _log(f"  files bulk: {c['downloaded']} dl / {c['skipped']} skip / "
+         f"{c['failed']} fail / {c['locked']} locked / {c['total']} total", logfh)
     return len(files), total_bytes
 
 
@@ -416,7 +557,7 @@ def write_state_md(course, cdir, counts):
     (cdir / "STATE.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def process_course(request, course, agg, logfh):
+def process_course(request, course, agg, logfh, files_bulk=False, dl_stats=None):
     _log(f"\n[course] {course_label(course)} (id={course['id']})", logfh)
     cdir = course_dir(course)
     cdir.mkdir(parents=True, exist_ok=True)
@@ -428,7 +569,9 @@ def process_course(request, course, agg, logfh):
     counts["assignments"]   = sync_assignments(request, course, cdir, logfh)
     counts["modules"]       = sync_modules(request, course, cdir, logfh)
     counts["pages"]         = sync_pages(request, course, cdir, logfh)
-    n_files, files_bytes    = sync_files_listing(request, course, cdir, logfh)
+    n_files, files_bytes    = sync_files_listing(request, course, cdir, logfh,
+                                                  files_bulk=files_bulk,
+                                                  dl_stats=dl_stats)
     counts["files"]         = n_files
     counts["files_bytes"]   = files_bytes
     modules_data = load_json(cdir / "modules.json", [])
@@ -459,10 +602,13 @@ def _read_token():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync USF Canvas metadata to local mirror (no bulk file download)")
+    parser = argparse.ArgumentParser(description="Sync USF Canvas content to local mirror")
     parser.add_argument("--log", help="Write progress log to this file in addition to stdout.")
     parser.add_argument("--course-id", type=int, default=None,
                         help="Only sync this course id (debug / single-course re-run)")
+    parser.add_argument("--files-bulk", action="store_true",
+                        help="Also download every non-locked course file under <course>/files/. "
+                             "Resumes via on-disk size dedupe.")
     opts = parser.parse_args()
 
     MIRROR_ROOT.mkdir(parents=True, exist_ok=True)
@@ -470,7 +616,8 @@ def main():
 
     logfh = open(opts.log, "a", encoding="utf-8") if opts.log else None
     if logfh:
-        _log(f"=== canvas_sync_usf.py run started {datetime.datetime.now().isoformat()} ===", logfh)
+        _log(f"=== canvas_sync_usf.py run started {datetime.datetime.now().isoformat()} "
+             f"(files_bulk={opts.files_bulk}) ===", logfh)
 
     token = _read_token()
 
@@ -480,6 +627,8 @@ def main():
         "pages": 0, "files": 0, "files_bytes": 0, "lti": 0,
         "auth_errors": [],
     }
+    dl_stats = {"downloaded": 0, "skipped": 0, "failed": 0, "locked": 0,
+                "bytes": 0, "courses": {}, "large_files": []}
 
     with sync_playwright() as p:
         request = p.request.new_context(
@@ -490,17 +639,16 @@ def main():
             },
         )
 
-        # Identity check
-        me = api_get(request, "users/self/profile", logfh=logfh)
-        if not me or "id" not in me:
-            _log("[fail] token rejected or empty profile response.", logfh)
-            agg["auth_errors"].append("users/self/profile returned no id")
+        try:
+            me = canvas_auth.preflight(request, CANVAS_HOST, scope="usf")
+        except canvas_auth.AuthError as e:
+            _log(f"[auth-fail] {e}", logfh)
+            agg["auth_errors"].append(str(e))
             request.dispose()
             if logfh:
                 logfh.close()
             sys.exit(3)
-        _log(f"[auth] {me.get('name')} <{me.get('primary_email') or me.get('login_id')}>"
-             f"  (id={me.get('id')})", logfh)
+        _log(f"[auth] {me.name} <{me.email}>  (id={me.user_id})", logfh)
 
         courses = api_list(request, "courses", params={
             "enrollment_state": "active",
@@ -519,7 +667,12 @@ def main():
 
         for course in courses:
             try:
-                process_course(request, course, agg, logfh)
+                process_course(request, course, agg, logfh,
+                               files_bulk=opts.files_bulk, dl_stats=dl_stats)
+            except canvas_auth.AuthError as e:
+                _log(f"  [auth-fail mid-run] {course_label(course)}: {e}", logfh)
+                agg["auth_errors"].append(str(e))
+                break
             except Exception as e:
                 _log(f"  [err] {course_label(course)}: {e}", logfh)
                 agg["courses_fail"] += 1
@@ -535,7 +688,12 @@ def main():
     _log(f"  Assignments:   {agg['assignments']}", logfh)
     _log(f"  Modules:       {agg['modules']}", logfh)
     _log(f"  Pages:         {agg['pages']}", logfh)
-    _log(f"  File records:  {agg['files']}  ({agg['files_bytes'] / (1024 * 1024):.1f} MB — not downloaded)", logfh)
+    if opts.files_bulk:
+        gb = dl_stats["bytes"] / (1024 ** 3)
+        _log(f"  Files (bulk):  {dl_stats['downloaded']} dl / {dl_stats['skipped']} skip / "
+             f"{dl_stats['failed']} fail / {dl_stats['locked']} locked  ({gb:.2f} GB on disk)", logfh)
+    else:
+        _log(f"  File records:  {agg['files']}  ({agg['files_bytes'] / (1024 * 1024):.1f} MB — not downloaded)", logfh)
     _log(f"  LTI externals: {agg['lti']}", logfh)
     if agg["auth_errors"]:
         _log(f"  Auth errors: {len(agg['auth_errors'])}", logfh)
@@ -543,7 +701,7 @@ def main():
             _log(f"    {e}", logfh)
 
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_json(LOGS_DIR / f"usf-summary-{ts}.json", agg)
+    save_json(LOGS_DIR / f"usf-summary-{ts}.json", {**agg, "downloads": dl_stats if opts.files_bulk else None})
 
     if logfh:
         _log(f"=== canvas_sync_usf.py run ended {datetime.datetime.now().isoformat()} ===", logfh)
